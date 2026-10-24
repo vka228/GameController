@@ -42,6 +42,7 @@ pub mod cli;
 mod connection_status;
 pub mod launch;
 mod logger;
+pub mod sim_rtf;
 
 use connection_status::{
     get_connection_status_map, get_next_connection_status_change, AlivenessTimestampMap,
@@ -49,6 +50,7 @@ use connection_status::{
 };
 use launch::{LaunchSettings, NetworkInterface, Team};
 use logger::FileLogger;
+use sim_rtf::{game_dt_to_wall_dt, scale_seek_dt, start_sim_rtf_receiver, SimRtfHandle};
 
 /// This struct represents the state that is sent to the UI.
 #[serde_as]
@@ -154,6 +156,7 @@ async fn event_loop(
     shutdown_token: CancellationToken,
     control_sender: watch::Sender<Game>,
     send_ui_state: Box<dyn Fn(UiState) -> Result<()> + Send>,
+    sim_rtf: SimRtfHandle,
 ) -> Result<()> {
     let mut last = Instant::now();
     let mut monitors = HashMap::<IpAddr, JoinSet<Result<()>>>::new();
@@ -194,19 +197,22 @@ async fn event_loop(
                 next_connection_status_change.unwrap_or(Duration::MAX),
             ));
 
-        let deadline = last.checked_add(dt);
+        // When RTF < 1, the same game-time dt needs more wall time.
+        // Must not mul_f64(Duration::MAX) — that panics (NaN / overflow).
+        let wall_dt = game_dt_to_wall_dt(dt, sim_rtf.factor());
+        let deadline = last.checked_add(wall_dt);
 
         select! {
             // We can't use deadline.unwrap() because it's still evaluated even if the branch is
             // disabled. Therefore we supply some Instant that we have already lying around.
             _ = sleep_until(deadline.unwrap_or(last)), if deadline.is_some() => {
                 let now = Instant::now();
-                game_controller.seek(now - last);
+                game_controller.seek(scale_seek_dt(now - last, sim_rtf.factor()));
                 last = now;
             },
             event = event_receiver.recv() => {
                 let now = Instant::now();
-                game_controller.seek(now - last);
+                game_controller.seek(scale_seek_dt(now - last, sim_rtf.factor()));
                 last = now;
                 match event {
                     Some(Event::MonitorRequest { host, data, too_long }) => {
@@ -306,7 +312,7 @@ async fn event_loop(
             },
             action = action_receiver.recv() => {
                 let now = Instant::now();
-                game_controller.seek(now - last);
+                game_controller.seek(scale_seek_dt(now - last, sim_rtf.factor()));
                 last = now;
                 if let Some(action) = action {
                     game_controller.apply(action, ActionSource::User);
@@ -319,7 +325,10 @@ async fn event_loop(
                 }
                 // This last seek is done so that the end timestamp in the log is more accurate
                 // (the end entry is added when the GameController is dropped).
-                game_controller.seek(Instant::now() - last);
+                game_controller.seek(scale_seek_dt(
+                    Instant::now() - last,
+                    sim_rtf.factor(),
+                ));
                 return Ok(());
             },
         };
@@ -451,7 +460,7 @@ pub async fn start_runtime(
         .find(|network_interface| network_interface.id == settings.network.interface)
         .unwrap();
 
-    let (event_receiver, control_sender, network_join_set) = {
+    let (event_receiver, control_sender, mut network_join_set) = {
         let game = game_controller.get_game(true).clone();
         let params = game_controller.params.clone();
         start_network(
@@ -480,6 +489,20 @@ pub async fn start_runtime(
     let ui_notify = Arc::new(Notify::new());
     let shutdown_token = CancellationToken::new();
 
+    // Bind on the selected interface so packets to docker0 gateway (172.17.0.1)
+    // from the Virtual Robot container reach us.
+    let (sim_rtf, sim_rtf_task) = start_sim_rtf_receiver(
+        network_interface.address,
+        settings.network.sim_rtf_port,
+    )
+    .await
+    .context("could not start sim RTF receiver")?;
+    if let Some(task) = sim_rtf_task {
+        network_join_set.spawn(async move {
+            let _ = task.await;
+        });
+    }
+
     runtime_join_set.spawn(event_loop(
         game_controller,
         event_receiver,
@@ -489,6 +512,7 @@ pub async fn start_runtime(
         shutdown_token.clone(),
         control_sender,
         send_ui_state,
+        sim_rtf,
     ));
 
     Ok(RuntimeState {

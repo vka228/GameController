@@ -41,4 +41,8 @@ pub struct Args {
     /// Specify the path to a log file to replay.
     #[arg(long)]
     pub replay: Option<PathBuf>,
+    /// UDP port for sim RTF sync from Virtual Robot (`game_controller_node`).
+    /// Match clocks advance as wall_dt * rtf. Use 0 to disable (always RTF=1).
+    #[arg(long, default_value_t = crate::sim_rtf::DEFAULT_SIM_RTF_PORT)]
+    pub sim_rtf_port: u16,
 }

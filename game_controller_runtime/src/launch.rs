@@ -75,6 +75,10 @@ pub struct WindowSettings {
     pub fullscreen: bool,
 }
 
+fn default_sim_rtf_port() -> u16 {
+    crate::sim_rtf::DEFAULT_SIM_RTF_PORT
+}
+
 /// This struct describes settings for the network.
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -85,6 +89,9 @@ pub struct NetworkSettings {
     pub broadcast: bool,
     /// Whether multicast groups should be joined to listen for simulated team communication.
     pub multicast: bool,
+    /// UDP port for sim RTF sync (0 = disabled). See [`crate::sim_rtf`].
+    #[serde(default = "default_sim_rtf_port")]
+    pub sim_rtf_port: u16,
 }
 
 /// This struct describes settings for logging.
@@ -402,6 +409,7 @@ pub fn make_launch_data(config_directory: &Path, args: Args) -> Result<LaunchDat
             },
             broadcast: args.broadcast,
             multicast: args.multicast,
+            sim_rtf_port: args.sim_rtf_port,
         },
         log: LogSettings {
             sync: args.sync,
